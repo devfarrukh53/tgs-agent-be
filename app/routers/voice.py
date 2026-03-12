@@ -71,7 +71,308 @@ async def initiate_call(
     Endpoint to initiate a voice call using Twilio.
     Thin wrapper around `voice_call_service.initiate_call`.
     """
+<<<<<<< HEAD
     return await initiate_call_service(call_request, http_request, user, db)
+=======
+    try:
+        # Verify authentication: either JWT token OR webhook secret
+        is_webhook = await verify_n8n_webhook_secret_async(http_request)
+        
+        if is_webhook:
+            # Webhook authentication - get tenant_id and user_id from request body
+            if not call_request.tenant_id:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="tenant_id is required in request body when using webhook secret"
+                )
+            try:
+                tenant_uuid = uuid.UUID(call_request.tenant_id)
+                user_uuid = uuid.UUID(call_request.user_id) if call_request.user_id else None
+            except ValueError:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="Invalid UUID format for tenant_id or user_id"
+                )
+            tenant_id_filter = tenant_uuid
+            user_id_filter = user_uuid
+        else:
+            # JWT authentication - get from user token
+            if not user:
+                raise HTTPException(
+                    status_code=status.HTTP_401_UNAUTHORIZED,
+                    detail="Authentication required: JWT token or n8n webhook secret"
+                )
+            tenant_id_filter = user.current_tenant_id
+            user_id_filter = user.id
+        
+        # Validate agent exists in database
+        try:
+            agent_id = uuid.UUID(call_request.agentId)
+            agent = agent_service.get_agent_by_id(db, agent_id, tenant_id_filter)
+        except (ValueError, HTTPException):
+            raise HTTPException(status_code=404, detail=f"Agent {call_request.agentId} not found")
+        
+        # Validate phone number format
+        if not twilio_service.validate_phone_number(call_request.userPhoneNumber):
+            raise HTTPException(status_code=400, detail="Invalid phone number format. Must start with +")
+        
+        # Check credits before initiating call
+        if not agent.model:
+            raise HTTPException(status_code=400, detail="Agent does not have a model configured")
+        
+        model_name = agent.model.model_name
+        has_sufficient, current_credits, required_credits = credit_service.has_sufficient_credits(
+            db=db,
+            tenant_id=tenant_id_filter,
+            model_name=model_name,
+            estimated_minutes=1  # Check for at least 1 minute
+        )
+        
+        if not has_sufficient:
+            # Log full details for debugging, but return a simple message to the client
+            logger.warning(f"❌ Insufficient credits: {current_credits} < {required_credits} for model {model_name}")
+            error_message = "Insufficient credits to initiate call."
+            raise HTTPException(
+                status_code=status.HTTP_402_PAYMENT_REQUIRED,
+                detail=error_message
+            )
+        
+        logger.info(f"✅ Credit check passed: {current_credits} credits available, {required_credits} required for model {model_name}")
+        
+        # Get phone number and credentials - Priority: User Selected > Agent Assigned > Env
+        from app.models.phone_number import PhoneNumber
+        
+        phone_number_obj = None
+        from_number = None
+        use_custom_credentials = False
+        account_sid = None
+        auth_token = None
+        
+        # Priority 1: Check if user explicitly selected a phone number (VAPI style)
+        if call_request.phone_number_id:
+            try:
+                phone_number_uuid = uuid.UUID(call_request.phone_number_id)
+                phone_number_obj = phone_number_service.get_phone_number_by_id(
+                    db=db,
+                    phone_number_id=phone_number_uuid,
+                    tenant_id=tenant_id_filter
+                )
+                if phone_number_obj and phone_number_obj.status == "active":
+                    logger.info(f"✅ Using user selected phone number: {phone_number_obj.phone_number} (ID: {phone_number_uuid})")
+                elif phone_number_obj and phone_number_obj.status != "active":
+                    # ✅ Phone number exists but is inactive - raise error
+                    raise HTTPException(
+                        status_code=status.HTTP_400_BAD_REQUEST,
+                        detail=f"Phone number {call_request.phone_number_id} is not active."
+                    )
+                else:
+                    # ✅ Phone number not found or belongs to different tenant - raise error
+                    raise HTTPException(
+                        status_code=status.HTTP_404_NOT_FOUND,
+                        detail=f"Phone number {call_request.phone_number_id} not found in your account."
+                    )
+            except HTTPException:
+                raise
+            except (ValueError, Exception) as e:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail=f"Invalid phone_number_id format: {str(e)}"
+                )
+        
+        # Priority 2: Check if agent has assigned phone number in DB
+        if not phone_number_obj and agent.id:
+            phone_number_obj = db.query(PhoneNumber).filter(
+                PhoneNumber.assistant_id == agent.id,
+                PhoneNumber.tenant_id == tenant_id_filter,
+                PhoneNumber.status == "active"
+            ).first()
+            if phone_number_obj:
+                logger.info(f"✅ Using agent's assigned phone number: {phone_number_obj.phone_number}")
+        
+        # Use selected phone number with credentials if available
+        if phone_number_obj and phone_number_obj.twilio_account_sid and phone_number_obj.twilio_auth_token:
+            # ✅ Use DB phone number with custom credentials (decrypt both)
+            from_number = phone_number_obj.phone_number
+            from app.core.security import decrypt_api_key
+            account_sid = decrypt_api_key(phone_number_obj.twilio_account_sid)
+            auth_token = decrypt_api_key(phone_number_obj.twilio_auth_token)
+            use_custom_credentials = True
+            logger.info(f"✅ Using DB phone number: {from_number} with custom credentials")
+        else:
+            # ✅ No fallback - user must have a phone number in DB
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="No phone number found. Please create and assign a phone number in your account before making calls."
+            )
+        
+        # Get base URL for webhooks
+        base_url = settings.WEBHOOK_BASE_URL
+        
+        # Create call session first so we can include the ID in webhook URLs
+        call_session = call_session_service.create_call_session(
+            db=db,
+            user_id=user_id_filter,
+            agent_id=agent.id,
+            tenant_id=tenant_id_filter,
+            twilio_call_sid="",  # Will be updated after call is made
+            from_number=from_number,  # ✅ Use selected phone number
+            to_number=call_request.userPhoneNumber,
+            call_type="outbound"  # Agent is initiating the call, so it's outbound
+        )
+        
+        # Direct WebSocket streaming connection (Vapi-style - no intermediate messages!)
+        # User speaks first, agent responds naturally
+        webhook_url = f"{base_url}/api/v1/voice/gather/streaming?agentId={agent.id}&userId={user_id_filter}&callSessionId={call_session.id}"
+        status_callback_url = f"{base_url}/api/v1/voice/webhook/call-events?agentId={agent.id}&userId={user_id_filter}&callSessionId={call_session.id}"
+        
+        logger.info(f"Making call with webhook_url: {webhook_url}")
+        logger.info(f"Making call with status_callback_url: {status_callback_url}")
+        
+        # Optional WebSocket broadcast
+        try:
+            await broadcast_call_status_update(
+                call_session_id=str(call_session.id),
+                status="initiating",
+                metadata={
+                    "agent_id": str(agent.id),
+                    "agent_name": agent.name,
+                    "to_number": call_request.userPhoneNumber,
+                    "from_number": from_number,  # ✅ Use selected phone number
+                    "timestamp": datetime.now(timezone.utc).isoformat()
+                }
+            )
+            logger.info(f"✅ WebSocket: Call initiating event sent")
+        except Exception as e:
+            logger.warning(f"⚠️ WebSocket broadcast failed (non-critical): {e}")
+        
+        # Make call with appropriate credentials
+        if use_custom_credentials:
+            # ✅ Use custom credentials from DB
+            call = twilio_service.make_call_with_credentials(
+                to_number=call_request.userPhoneNumber,
+                from_number=from_number,
+                webhook_url=webhook_url,
+                status_callback_url=status_callback_url,
+                account_sid=account_sid,
+                auth_token=auth_token
+            )
+        else:
+            # ✅ Use env credentials (current behavior)
+            call = twilio_service.make_call(
+                to_number=call_request.userPhoneNumber,
+                from_number=from_number,
+                webhook_url=webhook_url,
+                status_callback_url=status_callback_url
+            )
+        logger.info(f"✅ Call initiated successfully")
+        
+        # Update call session with Twilio SID
+        call_session.twilio_call_sid = call.sid
+        db.commit()
+        logger.info(f"✅ Updated call session {call_session.id} with Twilio SID: {call.sid}")
+        
+        # Broadcast call initiated event AFTER Twilio confirms
+        try:
+            await broadcast_call_status_update(
+                call_session_id=str(call_session.id),
+                status="initiated",
+                metadata={
+                    "call_sid": call.sid,
+                    "agent_id": str(agent.id),
+                    "agent_name": agent.name,
+                    "to_number": request.userPhoneNumber,
+                    "from_number": twilio_service.get_phone_number(),
+                    "timestamp": datetime.now(timezone.utc).isoformat()
+                }
+            )
+            logger.info(f"✅ Call initiated event sent for session {call_session.id}")
+        except Exception as e:
+            logger.warning(f"⚠️ Failed to send call initiated event (non-critical): {e}")
+        
+        # Generate call ID
+        call_id = f"call_{call.sid[-8:]}"
+        
+        # Determine which fields to echo back (prioritize generic fields, fallback to legacy)
+        crm_container_id = call_request.crm_container_id or call_request.board_id
+        crm_item_id = call_request.crm_item_id or call_request.monday_item_id
+        status_field_id = call_request.status_field_id or call_request.status_column_id
+        call_session_id_field_id = call_request.call_session_id_field_id or call_request.call_session_id_column_id
+        
+        return create_success_response(
+            CallInitiateResponse(
+                callId=call_id,
+                twilioCallSid=call.sid,
+                callSessionId=str(call_session.id),
+                status="initiated",
+                # Legacy Monday.com fields (for backward compatibility)
+                board_id=call_request.board_id,  # Echo back if provided by n8n
+                monday_item_id=call_request.monday_item_id,  # Echo back if provided by n8n
+                status_column_id=call_request.status_column_id,  # Echo back if provided by n8n
+                call_session_id_column_id=call_request.call_session_id_column_id,  # Echo back if provided by n8n
+                # Generic CRM fields (for multi-CRM support)
+                crm_container_id=crm_container_id,  # Echo back generic container ID
+                crm_item_id=crm_item_id,  # Echo back generic item ID
+                status_field_id=status_field_id,  # Echo back generic status field ID
+                call_session_id_field_id=call_session_id_field_id,  # Echo back generic call_session_id field ID
+                crm_type=call_request.crm_type  # Echo back CRM type if provided
+            ),
+            "Call initiated successfully"
+        )
+        
+    except HTTPException as e:
+        # Return error response with CRM metadata (same format as success response)
+        # This allows n8n workflow to access CRM fields even on errors
+        # Prioritize generic fields, fallback to legacy
+        crm_container_id = call_request.crm_container_id or call_request.board_id
+        crm_item_id = call_request.crm_item_id or call_request.monday_item_id
+        status_field_id = call_request.status_field_id or call_request.status_column_id
+        call_session_id_field_id = call_request.call_session_id_field_id or call_request.call_session_id_column_id
+        
+        error_response = CallInitiateErrorResponse(
+            detail=e.detail,
+            # Legacy Monday.com fields (for backward compatibility)
+            board_id=call_request.board_id,
+            monday_item_id=call_request.monday_item_id,
+            status_column_id=call_request.status_column_id,
+            call_session_id_column_id=call_request.call_session_id_column_id,
+            # Generic CRM fields (for multi-CRM support)
+            crm_container_id=crm_container_id,
+            crm_item_id=crm_item_id,
+            status_field_id=status_field_id,
+            call_session_id_field_id=call_session_id_field_id,
+            crm_type=call_request.crm_type
+        )
+        # Return JSONResponse with same status code as HTTPException
+        return JSONResponse(
+            status_code=e.status_code,
+            content=error_response.dict(exclude_none=True)
+        )
+    except Exception as e:
+        # Handle unexpected errors - also include metadata if available
+        crm_container_id = call_request.crm_container_id or call_request.board_id
+        crm_item_id = call_request.crm_item_id or call_request.monday_item_id
+        status_field_id = call_request.status_field_id or call_request.status_column_id
+        call_session_id_field_id = call_request.call_session_id_field_id or call_request.call_session_id_column_id
+        
+        error_response = CallInitiateErrorResponse(
+            detail=str(e),
+            # Legacy Monday.com fields (for backward compatibility)
+            board_id=call_request.board_id,
+            monday_item_id=call_request.monday_item_id,
+            status_column_id=call_request.status_column_id,
+            call_session_id_column_id=call_request.call_session_id_column_id,
+            # Generic CRM fields (for multi-CRM support)
+            crm_container_id=crm_container_id,
+            crm_item_id=crm_item_id,
+            status_field_id=status_field_id,
+            call_session_id_field_id=call_session_id_field_id,
+            crm_type=call_request.crm_type
+        )
+        return JSONResponse(
+            status_code=500,
+            content=error_response.dict(exclude_none=True)
+        )
+>>>>>>> origin/dev
 @router.post("/webhook/call-events", response_class=HTMLResponse,include_in_schema=False)
 async def handle_call_events_webhook(
     request: Request,
@@ -1361,6 +1662,67 @@ async def analyze_call_transcript(
             raise HTTPException(
                 status_code=403, detail="Access denied to this call session"
             )
+<<<<<<< HEAD
+=======
+        
+        # Get transcript messages
+        transcript_messages = transcript_service.get_messages_by_session(db, session_uuid)
+        logger.debug(f"🔍 Found {len(transcript_messages)} transcript messages for session {call_session_id}")
+        
+        if not transcript_messages:
+            raise HTTPException(status_code=404, detail="No transcript messages found for this call session")
+        
+        # Format transcript for analysis
+        transcript_text = ""
+        for msg in transcript_messages:
+            role_label = "Agent" if msg.role == "agent" else "Customer"
+            transcript_text += f"{role_label}: {msg.message}\n"
+        
+        # Create analysis prompts (include agent prompt for context where available)
+        summary_prompt = f"""
+        You are analyzing a phone call handled by an AI voice agent.
+        Agent's system prompt / instructions (for context about purpose and tone):
+        \"\"\"
+        {agent_prompt or "No specific agent prompt provided."}
+        \"\"\"
+        
+        Analyze this call transcript and provide a brief summary in 2-3 sentences.
+        
+        Call Transcript:
+        {transcript_text}
+        
+        Provide only:
+        - Brief call overview
+        - Main topic/issue
+        - Outcome/resolution
+        
+        Keep it concise and to the point.
+        """
+        
+        sentiment_prompt = f"""
+        You are analyzing a phone call handled by an AI voice agent.
+        Agent's system prompt / instructions (for context about purpose and tone):
+        \"\"\"
+        {agent_prompt or "No specific agent prompt provided."}
+        \"\"\"
+        
+        Analyze the sentiment of this call transcript and provide a brief assessment.
+        
+        Call Transcript:
+        {transcript_text}
+        
+        Provide only:
+        - Overall sentiment (positive/negative/neutral)
+        - Sentiment score (0-100)
+        - Customer satisfaction level (high/medium/low)
+        
+        Keep it brief and concise.
+        """
+        
+        # Create recommendations prompt based on agent's instructions
+        recommendations_prompt = f"""
+Analyze this call transcript and provide 2-3 brief, actionable recommendations for the agent.
+>>>>>>> origin/dev
 
         analysis_result = voice_analysis_service.analyze_call_transcript(
             db=db,
