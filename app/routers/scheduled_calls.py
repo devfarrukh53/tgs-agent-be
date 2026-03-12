@@ -22,6 +22,7 @@ from app.schemas.scheduled_call import (
     PendingCountResponse,
     PendingCountByCrm,
     JiraBatchAnalysisRequest,
+    ScheduleFromCallSessionRequest,
 )
 from app.schemas.crm_config import CRMConfigResponse, CRMConfigListResponse, CRMConfigListItem
 from app.services.scheduled_call_service import ScheduledCallService
@@ -514,6 +515,59 @@ async def create_single_scheduled_call(
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to create scheduled call: {str(e)}")
+
+
+@router.post("/from-call-session", response_model=SuccessResponse[SingleCallResponse])
+async def create_scheduled_call_from_call_session(
+    body: ScheduleFromCallSessionRequest = Body(...),
+    user: User = Depends(require_tenant),
+    db: Session = Depends(get_db),
+):
+    """
+    Create a scheduled call in CRM from a **completed** call session.
+
+    User reviews the call, then hits this endpoint. Backend reads the session's transcript
+    (and optional call_metadata["scheduled_call_request"]) to get date, time, and timezone or city.
+    If only city is provided, timezone is resolved via city/country. Optional agent_id chooses
+    which agent to use for the scheduled call; otherwise the session's agent is used.
+
+    **Request body:**
+    - `call_session_id`: UUID of the completed call session
+    - `agent_id`: Optional UUID of the agent to use for the scheduled call (must belong to tenant)
+
+    **Flow:**
+    1. Validates call session exists and belongs to current tenant and is completed.
+    2. Gets schedule from call_metadata["scheduled_call_request"] or extracts from transcript (LLM).
+    3. Resolves timezone (explicit or from city/country).
+    4. Creates one scheduled call item in the user's linked CRM board.
+    """
+    try:
+        try:
+            session_uuid = uuid.UUID(body.call_session_id)
+        except ValueError:
+            raise HTTPException(status_code=400, detail="Invalid call_session_id format")
+        agent_override: Optional[uuid.UUID] = None
+        if body.agent_id:
+            try:
+                agent_override = uuid.UUID(body.agent_id)
+            except ValueError:
+                raise HTTPException(status_code=400, detail="Invalid agent_id format")
+
+        result = await scheduled_call_service.create_scheduled_call_from_call_session(
+            db=db,
+            call_session_id=session_uuid,
+            current_tenant_id=user.current_tenant_id,
+            current_user_id=user.id,
+            agent_id_override=agent_override,
+        )
+        return create_success_response(
+            SingleCallResponse(**result),
+            result["message"],
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to create scheduled call from call session: {str(e)}")
 
 
 @router.get("/crm-config", response_model=SuccessResponse[CRMConfigListResponse])

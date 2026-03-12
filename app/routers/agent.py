@@ -287,6 +287,11 @@ The SYSTEM PROMPT should include:
    - What key information to collect (name, phone, email, reason for contact, booking details, etc.).
    - How to confirm and summarize important details.
    - How to close the conversation politely.
+   - If the agent is expected to SCHEDULE a call, meeting, or interview:
+     * Instruct the agent to ask for the desired date and local time.
+     * Instruct the agent to ask for the caller's time zone (e.g. "Asia/Karachi", "Europe/Berlin").
+     * If the caller does NOT know their time zone, the agent must ask for their city and country instead.
+     * The agent must clearly repeat/confirm the final scheduled date/time together with the time zone or city before ending the call.
 
 6) Edge Cases & Safety:
    - How to handle unclear questions (ask polite clarifying questions).

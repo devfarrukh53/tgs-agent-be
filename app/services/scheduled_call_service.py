@@ -1,10 +1,12 @@
 from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
 import csv
 import io
+import json
 import httpx
 import asyncio
 import uuid
-from typing import Optional, Tuple
+from typing import Optional, Tuple, Dict, Any
 
 from fastapi import HTTPException
 from sqlalchemy import and_
@@ -12,11 +14,14 @@ from sqlalchemy.orm import Session
 
 from app.core.config import settings
 from app.models.agent import Agent
+from app.models.call_session import CallSession
+from app.models.phone_number import PhoneNumber
 from app.models.scheduled_call import ScheduledCall
 from app.models.tenant import Tenant
 from app.schemas.scheduled_call import CSVUploadResponse
 from app.services.monday_service import MondayService
 from app.core.logger import logger
+from app.utils.timezone_resolver import resolve_timezone_from_city
 
 
 class ScheduledCallService:
@@ -630,4 +635,350 @@ class ScheduledCallService:
             raise
         except Exception as e:
             raise HTTPException(status_code=500, detail=f"Failed to create {board_record.crm_type} item: {str(e)}")
+
+    @staticmethod
+    async def create_scheduled_call_from_session_if_needed(
+        db: Session,
+        call_session: CallSession,
+    ) -> Optional[dict]:
+        """
+        Inspect a completed call session and, if it contains a scheduling request
+        in call_metadata, create a scheduled call item in the user's CRM.
+
+        Expected structure in call_session.call_metadata["scheduled_call_request"]:
+        {
+            "local_date": "YYYY-MM-DD",
+            "local_time": "HH:MM" or "HH:MM:SS",
+            "timezone": "Asia/Karachi" | "Europe/Berlin" | ... (IANA name, preferred),
+            "city": "Lahore",
+            "country": "PK",
+            "phone_number": "+1234567890"  # optional, falls back to customer_phone_number
+        }
+        """
+        try:
+            if call_session.status != "completed":
+                return None
+
+            metadata = call_session.call_metadata or {}
+            schedule_req = metadata.get("scheduled_call_request")
+            if not schedule_req:
+                return None
+
+            local_date = schedule_req.get("local_date")
+            local_time = schedule_req.get("local_time")
+            tz_name = schedule_req.get("timezone")
+            city = schedule_req.get("city")
+            country = schedule_req.get("country")
+            phone_number = schedule_req.get("phone_number") or call_session.customer_phone_number
+
+            if not local_date or not local_time:
+                logger.warning(
+                    f"⚠️ scheduled_call_request present but missing local_date/local_time for session {call_session.id}"
+                )
+                return None
+
+            if not phone_number:
+                logger.warning(
+                    f"⚠️ scheduled_call_request present but no phone_number for session {call_session.id}"
+                )
+                return None
+
+            # Resolve timezone: use explicit timezone or resolve from city/country
+            resolved_tz = tz_name
+            if not resolved_tz and (city or country):
+                resolved_tz = resolve_timezone_from_city(city or "", country)
+            if not resolved_tz:
+                logger.warning(
+                    f"⚠️ scheduled_call_request missing timezone and city for session {call_session.id}"
+                )
+                return None
+
+            try:
+                tz = ZoneInfo(resolved_tz)
+            except Exception as e:
+                logger.error(f"❌ Invalid timezone '{tz_name}' in scheduled_call_request: {e}")
+                return None
+
+            # Build timezone-aware local datetime and convert to UTC
+            # Accept both HH:MM and HH:MM:SS
+            time_str = local_time.strip()
+            if len(time_str.split(":")) == 2:
+                time_str = f"{time_str}:00"
+
+            try:
+                local_dt = datetime.fromisoformat(f"{local_date}T{time_str}")
+            except ValueError:
+                logger.error(
+                    f"❌ Unable to parse local datetime from '{local_date} {local_time}' "
+                    f"for session {call_session.id}"
+                )
+                return None
+
+            if local_dt.tzinfo is None:
+                local_dt = local_dt.replace(tzinfo=tz)
+            else:
+                local_dt = local_dt.astimezone(tz)
+
+            scheduled_time_utc = local_dt.astimezone(timezone.utc)
+
+            # Determine CRM config / board for this user
+            board_record = ScheduledCallService.get_board_for_user(db, call_session.user_id)
+            if not board_record or not board_record.tenant_crm_config_id:
+                logger.warning(
+                    f"⚠️ No CRM board/config linked for user {call_session.user_id} – "
+                    f"cannot create scheduled call from session {call_session.id}"
+                )
+                return None
+
+            crm_config_id = board_record.tenant_crm_config_id
+
+            result = await ScheduledCallService.create_single_scheduled_call(
+                db=db,
+                tenant_id=call_session.tenant_id,
+                user_id=call_session.user_id,
+                phone_number=phone_number,
+                agent_id=call_session.agent_id,
+                call_time_utc=scheduled_time_utc.isoformat(),
+                crm_config_id=crm_config_id,
+                phone_number_id=None,
+            )
+
+            logger.info(
+                f"✅ Auto-created scheduled call in CRM from session {call_session.id} at "
+                f"{scheduled_time_utc.isoformat()} UTC"
+            )
+            return result
+
+        except HTTPException:
+            raise
+        except Exception as e:
+            logger.error(
+                f"❌ Error creating scheduled call from session {call_session.id}: {e}",
+                exc_info=True,
+            )
+            return None
+
+    @staticmethod
+    def _resolve_timezone_for_schedule(
+        tz_name: Optional[str],
+        city: Optional[str],
+        country: Optional[str],
+    ) -> Optional[str]:
+        """Resolve IANA timezone from explicit timezone or city/country."""
+        if (tz_name or "").strip():
+            return tz_name.strip()
+        if (city or "").strip():
+            return resolve_timezone_from_city(city or "", country)
+        return None
+
+    @staticmethod
+    async def _extract_schedule_from_transcript(
+        db: Session,
+        transcript_text: str,
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Use LLM to extract scheduling intent from transcript.
+        Returns dict with local_date, local_time, timezone?, city?, country?, phone_number? or None.
+        """
+        from app.services.openai_service import openai_service
+        from app.services.model_service import model_service
+        from app.core.security import decrypt_api_key
+
+        if not (transcript_text or "").strip() or transcript_text.strip() == "No transcript available.":
+            return None
+        model_name = "gpt-4o-mini"
+        api_key: Optional[str] = None
+        try:
+            model = model_service.get_model_by_name(db, model_name)
+            if model and model.api_key:
+                api_key = decrypt_api_key(model.api_key)
+        except Exception as e:
+            logger.error(f"Schedule extraction: failed to get API key for {model_name}: {e}")
+            return None
+        if not api_key:
+            return None
+        system_prompt = """You are a strict extraction assistant. From a call transcript, extract ONLY if the user and agent agreed to schedule a follow-up call or meeting.
+Output a single JSON object with these keys (use null for missing):
+- local_date: YYYY-MM-DD (date they agreed)
+- local_time: HH:MM or HH:MM:SS (local time they agreed)
+- timezone: IANA timezone e.g. Asia/Karachi, Europe/Berlin (if mentioned)
+- city: city name if user said their city instead of timezone
+- country: country code or name if mentioned
+- phone_number: phone number to call if mentioned (E.164 with +)
+If no clear scheduling agreement (date + time) is present, output: {"local_date": null, "local_time": null}.
+Output ONLY valid JSON, no markdown or explanation."""
+        user_msg = f"Transcript:\n\"\"\"\n{transcript_text[:12000]}\n\"\"\""
+        try:
+            resp = openai_service.chat_completion(
+                messages=[{"role": "user", "content": user_msg}],
+                system_prompt=system_prompt,
+                model_name=model_name,
+                temperature=0.1,
+                max_tokens=300,
+                api_key=api_key,
+            )
+            content = (resp.get("content") or "").strip()
+            if not content:
+                return None
+            parsed = json.loads(content)
+            if not parsed.get("local_date") or not parsed.get("local_time"):
+                return None
+            return parsed
+        except Exception as e:
+            logger.warning(f"Schedule extraction from transcript failed: {e}")
+            return None
+
+    @staticmethod
+    async def create_scheduled_call_from_call_session(
+        db: Session,
+        call_session_id: uuid.UUID,
+        current_tenant_id: uuid.UUID,
+        current_user_id: uuid.UUID,
+        agent_id_override: Optional[uuid.UUID] = None,
+    ) -> dict:
+        """
+        Create a scheduled call in CRM from a completed call session.
+        User must call this endpoint after reviewing; no auto-schedule on call end.
+        Reads schedule from call_metadata["scheduled_call_request"] or extracts from transcript via LLM.
+        Optional agent_id_override: use this agent for the scheduled call instead of session's agent.
+        Raises 402 if current user does not have an active subscription for the linked CRM.
+        """
+        session = db.query(CallSession).filter(
+            CallSession.id == call_session_id,
+            CallSession.tenant_id == current_tenant_id,
+        ).first()
+        if not session:
+            raise HTTPException(status_code=404, detail="Call session not found")
+        if session.status != "completed":
+            raise HTTPException(
+                status_code=400,
+                detail="Call session is not completed; only completed sessions can be used to create a scheduled call.",
+            )
+
+        metadata = session.call_metadata or {}
+        schedule_req = metadata.get("scheduled_call_request")
+        if not schedule_req:
+            transcript_entries = session.call_transcript or []
+            transcript_lines = []
+            for entry in transcript_entries:
+                role = (entry.get("role") or "unknown").capitalize()
+                content = entry.get("content") or entry.get("message") or ""
+                transcript_lines.append(f"{role}: {content}")
+            transcript_text = "\n".join(transcript_lines) if transcript_lines else ""
+            schedule_req = await ScheduledCallService._extract_schedule_from_transcript(db, transcript_text)
+        if not schedule_req:
+            raise HTTPException(
+                status_code=400,
+                detail="No scheduling information found in call metadata or transcript. Ensure the call contained an agreed date, time, and timezone or city.",
+            )
+
+        local_date = schedule_req.get("local_date")
+        local_time = schedule_req.get("local_time")
+        if not local_date or not local_time:
+            raise HTTPException(
+                status_code=400,
+                detail="Missing date or time in scheduling information.",
+            )
+        # Destination: who we are calling again (customer) – use the original session's to_number/customer_phone_number
+        phone_number = session.to_number or session.customer_phone_number
+        if not phone_number:
+            raise HTTPException(
+                status_code=400,
+                detail="No destination phone number available for the scheduled call (session).",
+            )
+
+        tz_name = schedule_req.get("timezone")
+        city = schedule_req.get("city")
+        country = schedule_req.get("country")
+        resolved_tz = ScheduledCallService._resolve_timezone_for_schedule(tz_name, city, country)
+        if not resolved_tz:
+            raise HTTPException(
+                status_code=400,
+                detail="Could not determine timezone. Provide timezone (e.g. Asia/Karachi) or city and country in the call.",
+            )
+        try:
+            tz = ZoneInfo(resolved_tz)
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=f"Invalid timezone: {e}")
+
+        time_str = str(local_time).strip()
+        if len(time_str.split(":")) == 2:
+            time_str = f"{time_str}:00"
+        try:
+            local_dt = datetime.fromisoformat(f"{local_date}T{time_str}")
+        except ValueError:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Invalid date/time format: {local_date} {local_time}",
+            )
+        if local_dt.tzinfo is None:
+            local_dt = local_dt.replace(tzinfo=tz)
+        else:
+            local_dt = local_dt.astimezone(tz)
+        scheduled_time_utc = local_dt.astimezone(timezone.utc)
+
+        agent_id = session.agent_id
+        if agent_id_override:
+            agent = db.query(Agent).filter(
+                Agent.id == agent_id_override,
+                Agent.tenant_id == current_tenant_id,
+                Agent.is_deleted == False,
+            ).first()
+            if not agent:
+                raise HTTPException(status_code=404, detail="Agent not found or does not belong to tenant")
+            agent_id = agent_id_override
+
+        board_record = ScheduledCallService.get_board_for_user(db, session.user_id)
+        if not board_record or not board_record.tenant_crm_config_id:
+            raise HTTPException(
+                status_code=400,
+                detail="No CRM board linked for your account. Link a CRM in scheduled calls settings first.",
+            )
+
+        from app.services.crm_config_service import CRMConfigService
+        from app.services.billing_service import BillingService
+
+        crm_config_service = CRMConfigService()
+        crm_config = crm_config_service.get_crm_config_by_id(db, board_record.tenant_crm_config_id)
+        if not crm_config:
+            raise HTTPException(status_code=404, detail="CRM configuration not found")
+        if not BillingService.has_crm_access(db, current_user_id, crm_config.crm_type):
+            raise HTTPException(
+                status_code=402,
+                detail=f"You do not have an active subscription for {crm_config.crm_type}. Please subscribe to a plan for this CRM.",
+            )
+
+        # From-line: which number we call from (assistant). Reuse the assistant number from the original call session.
+        assistant_number = session.from_number or session.assistant_phone_number
+        if not assistant_number:
+            raise HTTPException(
+                status_code=400,
+                detail="Assistant phone number not found for this call session.",
+            )
+
+        pn = db.query(PhoneNumber).filter(
+            PhoneNumber.phone_number == assistant_number,
+            PhoneNumber.tenant_id == session.tenant_id,
+        ).first()
+        if not pn:
+            raise HTTPException(
+                status_code=404,
+                detail="Phone number ID not found. The assistant number used in this call is not registered in your tenant's phone numbers.",
+            )
+        phone_number_id = str(pn.id)
+
+        result = await ScheduledCallService.create_single_scheduled_call(
+            db=db,
+            tenant_id=session.tenant_id,
+            user_id=session.user_id,
+            phone_number=phone_number,
+            agent_id=agent_id,
+            call_time_utc=scheduled_time_utc.isoformat(),
+            crm_config_id=board_record.tenant_crm_config_id,
+            phone_number_id=phone_number_id,
+        )
+        logger.info(
+            f"✅ Created scheduled call in CRM from session {call_session_id} at {scheduled_time_utc.isoformat()} UTC"
+        )
+        return result
 

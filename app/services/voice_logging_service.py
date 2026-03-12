@@ -15,7 +15,6 @@ from app.models.call_log import CallLog
 from app.models.agent import Agent
 from app.schemas.call_log import CallLogCreate, CallLogUpdate
 
-
 from app.core.logger import logger
 
 class VoiceLoggingService:

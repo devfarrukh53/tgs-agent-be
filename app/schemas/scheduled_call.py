@@ -61,6 +61,12 @@ class SelectCrmConfigRequest(BaseModel):
     crm_config_ids: List[str] = Field(..., min_length=1, description="List of CRM config IDs (UUIDs) to link with user")
 
 
+class ScheduleFromCallSessionRequest(BaseModel):
+    """Request to create a scheduled call in CRM from a completed call session."""
+    call_session_id: str = Field(..., description="Call session ID (UUID) whose transcript/metadata will be used")
+    agent_id: Optional[str] = Field(None, description="Optional agent ID to use for the scheduled call; if omitted, session's agent is used")
+
+
 class JiraBatchAnalysisRequest(BaseModel):
     """Request body for Jira batch analysis endpoint"""
     call_session_ids: List[str] = Field(..., description="List of call session IDs (UUIDs)")

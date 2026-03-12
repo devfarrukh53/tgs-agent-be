@@ -32,30 +32,22 @@ class GeminiService:
         return ""
     
     def get_client(self, api_key: str = None):
-        """Get or create Gemini client with specific API key"""
+        """Get or create Gemini client with specific API key using google-genai SDK."""
         # Use provided API key or fall back to global setting
         key_to_use = api_key or settings.GEMINI_API_KEY
         
         if not key_to_use:
-            raise Exception("Gemini API key not found. Please provide an API key or set GEMINI_API_KEY in your config.")
+            raise Exception(
+                "Gemini API key not found. Please provide an API key or set GEMINI_API_KEY in your config."
+            )
         
-        # Only recreate client if the API key has changed
-        if self._current_api_key != key_to_use:
+        # Only recreate client if the API key has changed or client is missing
+        if self._current_api_key != key_to_use or self._client is None:
             self._client = genai.Client(api_key=key_to_use)
             self._current_api_key = key_to_use
-            self._model_cache = {}  # Clear model cache when API key changes
+            self._model_cache = {}  # Kept for backward compatibility, not used with new SDK
         
         return self._client
-    
-    def get_model(self, model_name: str = "gemini-1.5-flash", api_key: str = None):
-        """Get or create Gemini model instance with specific API key"""
-        client = self.get_client(api_key)
-        cache_key = f"{model_name}_{api_key or 'default'}"
-        
-        if cache_key not in self._model_cache:
-            self._model_cache[cache_key] = client.get_model(model_name)
-        
-        return self._model_cache[cache_key]
     
     def generate_text(self, prompt: str, system_prompt: str = None, 
                      model_name: str = "gemini-1.5-flash", 
@@ -79,21 +71,22 @@ class GeminiService:
         try:
             start_time = time.time()
             
-            # Get model instance with specific API key
-            model = self.get_model(model_name, api_key)
+            # Get client instance with specific API key
+            client = self.get_client(api_key)
             
             # Prepare the full prompt
             full_prompt = prompt
             if system_prompt:
                 full_prompt = f"System: {system_prompt}\n\nUser: {prompt}"
             
-            # Generate content using new API
-            response = model.generate_content(
+            # Generate content using google-genai Client
+            response = client.models.generate_content(
+                model=model_name,
                 contents=full_prompt,
                 config={
-                    "temperature": temperature,
-                    "max_output_tokens": max_tokens,
-                }
+                    "temperature": float(temperature),
+                    "max_output_tokens": int(max_tokens),
+                },
             )
             
             end_time = time.time()
@@ -133,30 +126,25 @@ class GeminiService:
         if system_prompt:
             full_prompt = f"System: {system_prompt}\n\nUser: {prompt}"
 
-        # Get model instance (thread-safe via global client)
-        model = self.get_model(model_name, api_key)
+        # Get client instance (thread-safe via global client)
+        client = self.get_client(api_key)
 
         q: Queue = Queue()
         SENTINEL = object()
 
         def producer():
             try:
-                response = model.generate_content_stream(
+                response = client.models.generate_content_stream(
+                    model=model_name,
                     contents=full_prompt,
                     config={
-                        "temperature": temperature,
-                        "max_output_tokens": max_tokens,
-                    }
+                        "temperature": float(temperature),
+                        "max_output_tokens": int(max_tokens),
+                    },
                 )
                 for chunk in response:
                     try:
-                        # Extract text from chunk
-                        if hasattr(chunk, 'text'):
-                            text = chunk.text
-                        elif hasattr(chunk, 'candidates') and chunk.candidates:
-                            text = chunk.candidates[0].content.parts[0].text if chunk.candidates[0].content.parts else None
-                        else:
-                            text = None
+                        text = self._extract_text_from_response(chunk)
                         if text:
                             q.put(text)
                     except Exception:
@@ -203,45 +191,35 @@ class GeminiService:
         try:
             start_time = time.time()
             
-            # Get model instance with specific API key
-            model = self.get_model(model_name, api_key)
+            # Get client instance with specific API key
+            client = self.get_client(api_key)
             
-            # Prepare the conversation with system prompt
-            # For chat completion, we'll build a conversation history
-            conversation_parts = []
+            # Build a simple formatted conversation for text-only models
+            lines = []
             if system_prompt:
-                conversation_parts.append({"role": "system", "parts": [{"text": system_prompt}]})
+                lines.append(f"System: {system_prompt}")
             
-            # Add all messages to conversation
             for message in messages:
-                role = "user" if message["role"] == "user" else "model"
-                conversation_parts.append({"role": role, "parts": [{"text": message["content"]}]})
+                role = message.get("role", "user")
+                content = message.get("content", "")
+                if role == "assistant":
+                    prefix = "Assistant"
+                elif role == "system":
+                    prefix = "System"
+                else:
+                    prefix = "User"
+                lines.append(f"{prefix}: {content}")
             
-            # Generate response using chat completion
-            # Note: If the API doesn't support conversation_parts directly, we'll use a formatted prompt
-            if conversation_parts:
-                # Format as a single prompt for compatibility
-                formatted_prompt = ""
-                for part in conversation_parts:
-                    role = part["role"]
-                    text = part["parts"][0]["text"]
-                    formatted_prompt += f"{role.capitalize()}: {text}\n\n"
-                
-                response = model.generate_content(
-                    contents=formatted_prompt,
-                    config={
-                        "temperature": temperature,
-                        "max_output_tokens": max_tokens,
-                    }
-                )
-            else:
-                response = model.generate_content(
-                    contents="",
-                    config={
-                        "temperature": temperature,
-                        "max_output_tokens": max_tokens,
-                    }
-                )
+            formatted_prompt = "\n\n".join(lines)
+            
+            response = client.models.generate_content(
+                model=model_name,
+                contents=formatted_prompt,
+                config={
+                    "temperature": float(temperature),
+                    "max_output_tokens": int(max_tokens),
+                },
+            )
             
             end_time = time.time()
             response_time = end_time - start_time
